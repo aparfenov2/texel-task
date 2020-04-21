@@ -2,58 +2,73 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 
-#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
 
 // https://stackoverflow.com/questions/49582252/pybind-numpy-access-2d-nd-arrays
 
 namespace py = pybind11;
 
-//def run(image: np.ndarray, kernel_size: int, sigma: float):
+#define checkCudaErrors(val) check( (val), #val, __FILE__, __LINE__)
 
-py::handle run(py::handle _image, int kernel_size, double sigma) {
+template<typename T>
+void check(T err, const char* const func, const char* const file, const int line) {
+  if (err != cudaSuccess) {
+    std::cerr << "CUDA error at: " << file << ":" << line << std::endl;
+    std::cerr << cudaGetErrorString(err) << " " << func << std::endl;
+    exit(1);
+  }
+}
 
-    auto image = torch::utils::tensor_from_numpy(_image.ptr());
+void call_applyFilter(
+    const unsigned char *input, 
+    unsigned char *output, 
+    const unsigned int width, 
+    const unsigned int height, 
+    const float *kernel, 
+    const unsigned int kernelWidth);
 
-    auto x_cord = torch::arange(kernel_size);
-    auto x_grid = x_cord.repeat(kernel_size).view({kernel_size, kernel_size});
-    auto y_grid = x_grid.t();
-    auto xy_grid = torch::stack({x_grid, y_grid}, -1);
+// ----------- entry point -------------
 
-    auto mean = double(kernel_size - 1) / 2.0d;
-    auto variance = sigma * sigma;
+void run(py::array _image, py::array _kernel) {
 
-    auto kernel1 = 1.0d / (2.0d * M_PI * variance);
-    auto kernel = torch::pow(xy_grid - mean, 2);
-    kernel = torch::sum(kernel, -1);
-    kernel = torch::exp(-kernel / (2.0d * variance));
-    kernel = kernel * kernel1;
-    kernel = kernel / torch::sum(kernel);
+    auto image = _image.request();
+    auto kernel = _kernel.request();
+    const int num_channels = 3;
 
-    auto channels = image.sizes()[2];
+    int filterWidth = kernel.shape[0];
+    int numRowsImage = image.shape[0];
+    int numColsImage = image.shape[1];
+    float *h_filter = (float*) kernel.ptr;
+    unsigned char *h_image = (unsigned char*) image.ptr;
+    
+    unsigned char *d_red;
+    unsigned char *d_redBlurred;
+    float         *d_filter;
 
-    kernel = kernel.view({1, 1, kernel_size, kernel_size});
-    kernel = kernel.repeat({channels, 1, 1, 1});
-    kernel = kernel.cuda();
-    // kernel.requires_grad(false);
-    // f = nn.Conv2d(in_channels=channels, out_channels=channels,
-    //               kernel_size=kernel_size, groups=channels, bias=False)
-    auto opts = torch::nn::Conv2dOptions(channels, channels, kernel_size).groups(channels).bias(false);
-    auto f = torch::nn::Conv2d(opts);
-    f->weight = kernel;
-    f->weight.options().requires_grad(false);
+    size_t data_size = sizeof(unsigned char) * numRowsImage * numColsImage * num_channels;
+    size_t filter_size = sizeof(float) * filterWidth * filterWidth;
 
-	image = image.to(torch::kFloat);
-    image = image.permute({2, 1, 0}); // HWC -> CWH
-    image = image.unsqueeze(0);
-    image = image.cuda();
+    checkCudaErrors(cudaMalloc(&d_redBlurred, data_size ));
+    // checkCudaErrors(cudaMemset(d_redBlurred,   127, data_size));
 
-    auto ret = f(image);
-    ret = ret.cpu();
-    ret = ret.squeeze();
+    checkCudaErrors(cudaMalloc(&d_red,   data_size));
+    checkCudaErrors(cudaMemcpy(d_red, h_image, data_size, cudaMemcpyHostToDevice));
 
-    auto ret_np  = torch::utils::tensor_to_numpy(ret);
+    checkCudaErrors(cudaMalloc((void**)&d_filter, filter_size));
+    checkCudaErrors(cudaMemcpy(d_filter, h_filter, filter_size, cudaMemcpyHostToDevice));
 
-    return ret_np; //result;
+    call_applyFilter(d_red, d_redBlurred, numColsImage, numRowsImage, d_filter, filterWidth);
+
+    cudaDeviceSynchronize(); 
+    checkCudaErrors(cudaGetLastError());
+
+    unsigned char *image_out = (unsigned char *) image.ptr;
+    checkCudaErrors(cudaMemcpy(image_out, d_redBlurred, data_size, cudaMemcpyDeviceToHost));
+
+    checkCudaErrors(cudaFree(d_redBlurred));
+    checkCudaErrors(cudaFree(d_red));
+    checkCudaErrors(cudaFree(d_filter));
 }
 
 
